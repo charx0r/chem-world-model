@@ -95,3 +95,37 @@ def classify(batch_size: int) -> None:
     click.echo("Classifying reactions ...")
     total = classify_batch(engine, batch_size)
     click.echo(f"Classified {total} reactions.")
+
+
+# ---------------------------------------------------------------------------
+# query command
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("question")
+def query(question: str) -> None:
+    """Ask a chemistry question in natural language."""
+    from chemworldmodel.config import get_settings
+    from chemworldmodel.db.engine import get_sync_engine
+    from chemworldmodel.query.nl_to_sql import NLToSQL
+
+    settings = get_settings()
+    engine = get_sync_engine()
+    pipeline = NLToSQL(engine=engine, settings=settings)
+
+    click.echo(f"Query: {question}\n")
+    try:
+        result = pipeline.query_sync(question)
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"Answer:\n{result.answer}\n")
+    click.echo(f"Reactions found: {result.reaction_count}")
+    if result.citations:
+        shown = result.citations[:10]
+        click.echo(f"Citations: {', '.join(shown)}")
+        if result.reaction_count > 10:
+            click.echo(f"  ... and {result.reaction_count - 10} more")
+    click.echo(f"\nSQL:\n{result.sql}")

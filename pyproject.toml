@@ -22,6 +22,8 @@ dependencies = [
     "structlog>=24.1.0",
     "rdkit>=2025.9.6",
     "ord-schema>=0.3.99",
+    "google-genai>=1.68.0",
+    "openai>=2.30.0",
 ]
 
 [project.optional-dependencies]
