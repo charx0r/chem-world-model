@@ -275,10 +275,9 @@ def upgrade() -> None:
     op.execute(
         "CREATE INDEX idx_mol_substruct ON chem.molecules USING gist(mol)"
     )
-    op.execute(
-        "CREATE INDEX idx_fp_morgan_hnsw ON chem.molecules "
-        "USING hnsw (fp_morgan_vec vector_l2_ops) WITH (m = 16, ef_construction = 64)"
-    )
+    # Note: fp_morgan_vec HNSW index skipped — pgvector 0.8.2 limits HNSW to 2000 dims
+    # but Morgan fingerprints are 2048-bit. Use bit_jaccard_ops on fp_morgan instead,
+    # which is the correct Tanimoto similarity metric for binary fingerprints.
     op.execute(
         "CREATE INDEX idx_fp_morgan_bit ON chem.molecules "
         "USING hnsw (fp_morgan bit_jaccard_ops)"

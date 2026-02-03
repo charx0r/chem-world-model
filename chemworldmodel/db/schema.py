@@ -64,6 +64,8 @@ molecules = sa.Table(
     sa.Column("mol", RDKitMol()),
     sa.Column("fp_morgan", PgBit(2048)),
     sa.Column("fp_morgan_vec", Vector(2048)),
+    sa.Column("iupac_name", sa.Text),
+    sa.Column("complexity", sa.Float),
     sa.Column("sources", sa.ARRAY(sa.Text), server_default="{}"),
     sa.Column("cas_number", sa.Text),
     sa.Column("chembl_id", sa.Text),
@@ -158,6 +160,36 @@ reaction_conditions = sa.Table(
         "reaction_id", "condition_type", "phase", name="uq_cond_rxn_type_phase"
     ),
     schema="rxn",
+)
+
+bioactivities = sa.Table(
+    "bioactivities",
+    metadata,
+    sa.Column("id", sa.BigInteger, sa.Identity(), primary_key=True),
+    sa.Column(
+        "inchikey",
+        sa.Text,
+        sa.ForeignKey("chem.molecules.inchikey"),
+        nullable=False,
+    ),
+    sa.Column("target_chembl_id", sa.Text, nullable=False),
+    sa.Column("target_name", sa.Text),
+    sa.Column("target_organism", sa.Text),
+    sa.Column("activity_type", sa.Text, nullable=False),
+    sa.Column("value", sa.Float),
+    sa.Column("unit", sa.Text),
+    sa.Column("relation", sa.Text),
+    sa.Column("assay_chembl_id", sa.Text, nullable=False),
+    sa.Column("source_chembl_id", sa.Text),
+    sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("NOW()")),
+    sa.UniqueConstraint(
+        "inchikey",
+        "target_chembl_id",
+        "activity_type",
+        "assay_chembl_id",
+        name="uq_bioact_mol_target_type_assay",
+    ),
+    schema="chem",
 )
 
 # ---------------------------------------------------------------------------
