@@ -85,19 +85,49 @@ def classify_reaction(reaction_smiles: str) -> str | None:
     patterns = _get_compiled_patterns()
     for name, pattern in patterns.items():
         try:
-            if rxn.GetNumReactantTemplates() >= pattern.GetNumReactantTemplates():
-                # Simple heuristic: check if the pattern reactant count
-                # is compatible. Full substructure matching on reactions
-                # is expensive; this is a best-effort classifier.
-                # For production use, consider rdkit.Chem.rdChemReactions
-                pass
+            # Run the reaction template against the parsed reaction
+            products = pattern.RunReactants(
+                tuple(rxn.GetReactants() if hasattr(rxn, "GetReactants") else [])
+            )
+            if products:
+                return name
         except Exception:
             continue
 
-    # Fallback: try matching reactant/product substructures directly
+    # Fallback: match reactant and product substructures individually.
+    # Parse reactants/products and check if any pattern's reactant templates
+    # are substructures of the actual reactants.
     parts = reaction_smiles.split(">>")
     if len(parts) != 2:
         return None
+
+    from rdkit import Chem
+
+    reactant_mols = [Chem.MolFromSmiles(s) for s in parts[0].split(".") if s]
+    product_mols = [Chem.MolFromSmiles(s) for s in parts[1].split(".") if s]
+    reactant_mols = [m for m in reactant_mols if m is not None]
+    product_mols = [m for m in product_mols if m is not None]
+
+    if not reactant_mols or not product_mols:
+        return None
+
+    for name, pattern in patterns.items():
+        try:
+            # Check if pattern reactant templates match actual reactants
+            n_templates = pattern.GetNumReactantTemplates()
+            if n_templates > len(reactant_mols):
+                continue
+            matched = 0
+            for i in range(n_templates):
+                template = pattern.GetReactantTemplate(i)
+                for mol in reactant_mols:
+                    if mol.HasSubstructMatch(template):
+                        matched += 1
+                        break
+            if matched == n_templates:
+                return name
+        except Exception:
+            continue
 
     return None  # Classification is best-effort; many reactions won't match
 

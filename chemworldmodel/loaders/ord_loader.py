@@ -14,7 +14,7 @@ from typing import Any, Iterator
 import structlog
 from rdkit import Chem
 from rdkit.Chem import Descriptors, Crippen, rdMolDescriptors, inchi as rdinchi
-from sqlalchemy import Connection
+from sqlalchemy import Connection, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from chemworldmodel.db.schema import (
@@ -96,6 +96,14 @@ _TIME_UNITS = {
     reaction_pb2.Time.DAY: lambda v: v * 86400.0,
 }
 
+# Moles units → moles (stored in equivalents column as raw moles)
+_MOLES_UNITS = {
+    reaction_pb2.Moles.MOLE: lambda v: v,
+    reaction_pb2.Moles.MILLIMOLE: lambda v: v * 0.001,
+    reaction_pb2.Moles.MICROMOLE: lambda v: v * 1e-6,
+    reaction_pb2.Moles.NANOMOLE: lambda v: v * 1e-9,
+}
+
 # Atmosphere enum → string
 _ATMOSPHERE_MAP = {
     reaction_pb2.PressureConditions.Atmosphere.AIR: "air",
@@ -124,6 +132,8 @@ class ORDLoader(BaseLoader):
 
     def extract(self, **kwargs: Any) -> Iterator[reaction_pb2.Reaction]:
         """Yield individual Reaction messages from .pb.gz files."""
+        import gc
+
         data_dir = Path(kwargs["data_dir"])
         limit = kwargs.get("limit")
         count = 0
@@ -131,7 +141,7 @@ class ORDLoader(BaseLoader):
         pb_files = sorted(data_dir.glob("**/*.pb.gz"))
         self.log.info("found_pb_files", count=len(pb_files), data_dir=str(data_dir))
 
-        for pb_file in pb_files:
+        for file_idx, pb_file in enumerate(pb_files):
             try:
                 dataset = message_helpers.load_message(
                     str(pb_file), dataset_pb2.Dataset
@@ -140,18 +150,29 @@ class ORDLoader(BaseLoader):
                 self.log.warning("dataset_load_error", file=str(pb_file), error=str(e))
                 continue
 
+            n_reactions = len(dataset.reactions)
             self.log.info(
                 "processing_file",
                 file=pb_file.name,
-                reactions=len(dataset.reactions),
+                reactions=n_reactions,
+                file_num=file_idx + 1,
+                total_files=len(pb_files),
             )
 
-            for rxn in dataset.reactions:
+            # Copy reactions out of the dataset before releasing the protobuf
+            reactions = list(dataset.reactions)
+            del dataset
+            gc.collect()
+
+            for rxn in reactions:
                 yield rxn
                 count += 1
                 if limit and count >= limit:
                     self.log.info("limit_reached", limit=limit)
                     return
+
+            del reactions
+            gc.collect()
 
     def _get_item_id(self, raw_item: Any) -> str | None:
         if isinstance(raw_item, reaction_pb2.Reaction):
@@ -212,18 +233,18 @@ class ORDLoader(BaseLoader):
 
         for _input_name, reaction_input in rxn.inputs.items():
             for compound in reaction_input.components:
+                # Skip products in input blocks (they belong in outcomes)
+                if compound.reaction_role in (
+                    reaction_pb2.ReactionRole.PRODUCT,
+                    reaction_pb2.ReactionRole.BYPRODUCT,
+                    reaction_pb2.ReactionRole.SIDE_PRODUCT,
+                ):
+                    continue
+
                 role = _ROLE_MAP.get(compound.reaction_role)
-                if role is None or role == "product":
-                    # Input compounds shouldn't be products; skip unknown roles
-                    if compound.reaction_role not in (
-                        reaction_pb2.ReactionRole.UNSPECIFIED,
-                        reaction_pb2.ReactionRole.PRODUCT,
-                        reaction_pb2.ReactionRole.BYPRODUCT,
-                        reaction_pb2.ReactionRole.SIDE_PRODUCT,
-                    ):
-                        continue
-                    if role is None:
-                        continue
+                if role is None:
+                    # Unknown or UNSPECIFIED role — skip
+                    continue
 
                 parsed = _parse_compound(compound)
                 if parsed is None:
@@ -268,7 +289,7 @@ class ORDLoader(BaseLoader):
                 for measurement in product.measurements:
                     if measurement.type == _YIELD_TYPE:
                         if measurement.percentage.value > 0:
-                            product_yield = measurement.percentage.value
+                            product_yield = round(measurement.percentage.value, 2)
 
                 is_desired = getattr(product, "is_desired_product", False)
                 comp_key = (inchikey, "product")
@@ -277,6 +298,9 @@ class ORDLoader(BaseLoader):
                         "reaction_id": reaction_id,
                         "inchikey": inchikey,
                         "role": "product",
+                        "equivalents": None,
+                        "mass_g": None,
+                        "volume_ml": None,
                         "is_major": bool(is_desired),
                         "yield_pct": product_yield,
                     }
@@ -329,24 +353,27 @@ class ORDLoader(BaseLoader):
             for mol_row in record["molecules"]:
                 all_molecules[mol_row["inchikey"]] = mol_row
 
-        # 2. Upsert molecules
-        if all_molecules:
-            stmt = pg_insert(molecules).values(list(all_molecules.values()))
+        # 2. Upsert molecules (chunked to stay under 65535 param limit)
+        mol_list = list(all_molecules.values())
+        for chunk in _chunked(mol_list, 4000):
+            stmt = pg_insert(molecules).values(chunk)
             stmt = stmt.on_conflict_do_update(
                 index_elements=["inchikey"],
                 set_={
-                    "sources": molecules.c.sources.op("||")(
-                        stmt.excluded.sources
+                    "sources": text(
+                        "ARRAY(SELECT DISTINCT unnest("
+                        "COALESCE(chem.molecules.sources, '{}') "
+                        "|| COALESCE(EXCLUDED.sources, '{}')))"
                     ),
-                    "updated_at": stmt.excluded.updated_at,
+                    "updated_at": text("NOW()"),
                 },
             )
             conn.execute(stmt)
 
         # 3. Insert reactions
         reaction_rows = [record["reaction"] for record in batch]
-        if reaction_rows:
-            stmt = pg_insert(reactions).values(reaction_rows)
+        for chunk in _chunked(reaction_rows, 4000):
+            stmt = pg_insert(reactions).values(chunk)
             stmt = stmt.on_conflict_do_nothing(index_elements=["reaction_id"])
             conn.execute(stmt)
 
@@ -354,8 +381,8 @@ class ORDLoader(BaseLoader):
         all_components: list[dict] = []
         for record in batch:
             all_components.extend(record["components"])
-        if all_components:
-            stmt = pg_insert(reaction_components).values(all_components)
+        for chunk in _chunked(all_components, 8000):
+            stmt = pg_insert(reaction_components).values(chunk)
             stmt = stmt.on_conflict_do_nothing(constraint="uq_rc_rxn_mol_role")
             conn.execute(stmt)
 
@@ -363,8 +390,8 @@ class ORDLoader(BaseLoader):
         all_conditions: list[dict] = []
         for record in batch:
             all_conditions.extend(record["conditions"])
-        if all_conditions:
-            stmt = pg_insert(reaction_conditions).values(all_conditions)
+        for chunk in _chunked(all_conditions, 10000):
+            stmt = pg_insert(reaction_conditions).values(chunk)
             stmt = stmt.on_conflict_do_nothing(constraint="uq_cond_rxn_type_phase")
             conn.execute(stmt)
 
@@ -373,8 +400,8 @@ class ORDLoader(BaseLoader):
             {"inchikey": ik, "source_name": "ord", "load_id": load_id}
             for ik in all_molecules
         ]
-        if prov_rows:
-            stmt = pg_insert(molecule_provenance).values(prov_rows)
+        for chunk in _chunked(prov_rows, 20000):
+            stmt = pg_insert(molecule_provenance).values(chunk)
             stmt = stmt.on_conflict_do_nothing()
             conn.execute(stmt)
 
@@ -385,6 +412,12 @@ class ORDLoader(BaseLoader):
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+def _chunked(lst: list, size: int) -> Iterator[list]:
+    """Yield successive chunks of lst of the given size."""
+    for i in range(0, len(lst), size):
+        yield lst[i : i + size]
 
 
 def _parse_compound(
@@ -525,7 +558,7 @@ def _extract_yields(
                         yield_type = "percentage"
                 elif measurement.type == _SELECTIVITY_TYPE:
                     if measurement.percentage.value > 0:
-                        selectivity = f"{measurement.percentage.value:.1f}%"
+                        selectivity = str(round(measurement.percentage.value, 2))
 
     return best_yield, yield_type, selectivity
 
@@ -557,8 +590,8 @@ def _extract_amounts(
             volume_ml = round(converter(amount.volume.value), 6)
 
     if amount.HasField("moles"):
-        # Store moles as equivalents (relative to limiting reagent)
-        # ORD doesn't directly give equivalents, but moles can be used
-        pass
+        converter = _MOLES_UNITS.get(amount.moles.units)
+        if converter and amount.moles.value > 0:
+            equivalents = round(converter(amount.moles.value), 9)
 
     return mass_g, volume_ml, equivalents
