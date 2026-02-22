@@ -30,10 +30,22 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql+psycopg://cwm:${DB_PASSWORD:-changeme}@db:5432/chemworldmodel
-      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
+      LLM_MODEL: ${LLM_MODEL:-gemini-2.5-flash}
       LLM_API_KEY: ${LLM_API_KEY:-}
     volumes:
       - .:/app
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    environment:
+      NEXT_PUBLIC_API_URL: http://api:8000
 
 volumes:
   pgdata:
