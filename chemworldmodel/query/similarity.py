@@ -39,7 +39,26 @@ def find_similar_molecules(
 
     Returns:
         List of SimilarMolecule sorted by descending similarity.
+
+    Raises:
+        ValueError: If inputs are invalid.
     """
+    if not smiles or not smiles.strip():
+        raise ValueError("SMILES string must be non-empty")
+    if len(smiles) > 2000:
+        raise ValueError("SMILES string too long (max 2000 chars)")
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("threshold must be between 0.0 and 1.0")
+    if not 1 <= limit <= 1000:
+        raise ValueError("limit must be between 1 and 1000")
+
+    # Validate SMILES with RDKit before sending to PG
+    from rdkit import Chem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {smiles!r}")
+
     distance_threshold = 1.0 - threshold
 
     with engine.connect() as conn:

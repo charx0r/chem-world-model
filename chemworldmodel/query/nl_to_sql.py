@@ -25,12 +25,13 @@ from chemworldmodel.query.prompts import build_sql_generation_prompt, build_synt
 
 _BLOCKED_KEYWORDS = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|"
-    r"COPY|EXECUTE|CALL|VACUUM)\b",
+    r"COPY|EXECUTE|CALL|VACUUM|DO|LOAD|LISTEN|NOTIFY)\b",
     re.IGNORECASE,
 )
 
 _BLOCKED_FUNCTIONS = re.compile(
-    r"\b(dblink|lo_import|lo_export|pg_read_file|pg_ls_dir|pg_read_binary_file)\b",
+    r"\b(dblink|lo_import|lo_export|pg_read_file|pg_ls_dir|pg_read_binary_file|"
+    r"pg_write_file|pg_terminate_backend|pg_sleep|set_config)\b",
     re.IGNORECASE,
 )
 
@@ -41,6 +42,21 @@ _BLOCKED_SCHEMAS = re.compile(
 
 _ALLOWED_SCHEMA_PREFIX = re.compile(r"\b(\w+)\.")
 _ALLOWED_SCHEMAS = {"chem", "rxn", "onto", "lineage"}
+
+# Known table names and common SQL aliases used by the LLM
+_ALLOWED_IDENTIFIERS = {
+    # Table names (used as aliases in queries)
+    "molecules", "reactions", "reaction_components", "reaction_conditions",
+    "reaction_classes", "molecule_roles", "hazard_data", "data_loads",
+    "molecule_provenance",
+    # Common SQL functions and aliases
+    "round", "count", "array", "generate", "date", "extract",
+    "coalesce", "nullif", "greatest", "least", "concat",
+    "route", "result", "results", "subquery", "stats",
+}
+
+# Strip $$ ... $$ blocks (AGE Cypher) before schema validation
+_DOLLAR_QUOTED = re.compile(r"\$\$.*?\$\$", re.DOTALL)
 
 _LINE_COMMENT = re.compile(r"--[^\n]*")
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
@@ -68,9 +84,10 @@ def _validate_sql(sql: str, max_chars: int = 2000) -> str:
     if len(cleaned) > max_chars:
         raise SQLValidationError(f"SQL exceeds {max_chars} character limit ({len(cleaned)} chars)")
 
-    # Must start with SELECT
-    if not cleaned.upper().startswith("SELECT"):
-        raise SQLValidationError("Only SELECT statements are allowed")
+    # Must start with SELECT or WITH (CTEs)
+    upper = cleaned.upper()
+    if not (upper.startswith("SELECT") or upper.startswith("WITH")):
+        raise SQLValidationError("Only SELECT statements (with optional CTEs) are allowed")
 
     # Strip trailing semicolons
     cleaned = cleaned.rstrip(";").strip()
@@ -94,18 +111,18 @@ def _validate_sql(sql: str, max_chars: int = 2000) -> str:
     if match:
         raise SQLValidationError(f"Access to {match.group(0)} is not allowed")
 
-    # Verify only allowed schema prefixes
-    for schema_match in _ALLOWED_SCHEMA_PREFIX.finditer(cleaned):
+    # Verify only allowed schema prefixes.
+    # Strip $$ Cypher blocks first — identifiers inside Cypher (e.g. m.inchikey)
+    # are AGE property access, not PostgreSQL schema references.
+    sql_without_cypher = _DOLLAR_QUOTED.sub(" ", cleaned)
+    for schema_match in _ALLOWED_SCHEMA_PREFIX.finditer(sql_without_cypher):
         schema = schema_match.group(1).lower()
-        # Skip common SQL function/alias patterns and subquery aliases
         if schema in _ALLOWED_SCHEMAS:
             continue
-        # Allow table aliases (single letters, common abbreviations)
-        # and SQL keywords that look like schema.column (e.g., r.yield_pct)
-        if len(schema) <= 4 or schema in (
-            "round", "count", "array", "generate", "date", "extract",
-            "coalesce", "nullif", "greatest", "least", "concat",
-        ):
+        # Allow short aliases (single letters, common abbreviations like m1, r2)
+        if len(schema) <= 4:
+            continue
+        if schema in _ALLOWED_IDENTIFIERS:
             continue
         raise SQLValidationError(f"Schema '{schema}' is not in the allowed list")
 
@@ -272,16 +289,24 @@ class NLToSQL:
         return ground_answer(raw_results, str(answer_text), sql)
 
     async def _execute_sql(self, sql: str) -> list[dict[str, Any]]:
-        """Execute validated SQL with statement timeout."""
+        """Execute validated SQL in a read-only transaction with timeout."""
 
         def _run() -> list[dict[str, Any]]:
             timeout_ms = self.settings.query_timeout * 1000
             with self.engine.connect() as conn:
-                conn.execute(text(f"SET LOCAL statement_timeout = {timeout_ms}"))
-                result = conn.execute(text(sql))
-                columns = list(result.keys())
-                rows = result.fetchall()
-                return [dict(zip(columns, row)) for row in rows]
+                with conn.begin():
+                    conn.exec_driver_sql("SET TRANSACTION READ ONLY")
+                    conn.exec_driver_sql(
+                        f"SET LOCAL statement_timeout = {int(timeout_ms)}"
+                    )
+                    conn.exec_driver_sql("LOAD 'age'")
+                    conn.exec_driver_sql(
+                        "SET LOCAL search_path = ag_catalog, chem, rxn, onto, public"
+                    )
+                    result = conn.exec_driver_sql(sql)
+                    columns = list(result.keys())
+                    rows = result.fetchall()
+                    return [dict(zip(columns, row)) for row in rows]
 
         return await asyncio.to_thread(_run)
 

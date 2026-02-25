@@ -26,6 +26,8 @@ Columns:
 - hbd (INTEGER) — hydrogen bond donors
 - num_rotatable (INTEGER) — rotatable bonds
 - num_rings (INTEGER) — ring count
+- iupac_name (TEXT) — IUPAC systematic name (from PubChem enrichment)
+- complexity (FLOAT) — PubChem complexity score
 - mol (mol) — RDKit mol object (enables substructure search)
 - fp_morgan (bit(2048)) — Morgan/ECFP4 fingerprint (radius 2, 2048 bits)
 - sources (TEXT[]) — array e.g. ['ord', 'pubchem']
@@ -77,6 +79,31 @@ Columns:
 - phase (TEXT) — 'initial', 'during', 'final'
 Unique constraint: (reaction_id, condition_type, phase)
 
+### chem.bioactivities
+Bioactivity data from ChEMBL. Links molecules to biological targets.
+Columns:
+- id (BIGSERIAL PK)
+- inchikey (TEXT FK → chem.molecules)
+- target_chembl_id (TEXT NOT NULL) — ChEMBL target ID
+- target_name (TEXT) — e.g. 'HERG', 'Cyclooxygenase-2'
+- target_organism (TEXT) — e.g. 'Homo sapiens'
+- activity_type (TEXT NOT NULL) — e.g. 'IC50', 'Ki', 'EC50'
+- value (FLOAT) — activity value in standard units
+- unit (TEXT) — e.g. 'nM', 'uM'
+- relation (TEXT) — '=', '>', '<'
+- assay_chembl_id (TEXT NOT NULL)
+Unique constraint: (inchikey, target_chembl_id, activity_type, assay_chembl_id)
+
+### onto.hazard_data
+GHS hazard classifications (from PubChem).
+Columns:
+- inchikey (TEXT FK → chem.molecules)
+- ghs_codes (TEXT[]) — array of H-codes, e.g. ARRAY['H225', 'H319']
+- signal_word (TEXT) — 'Danger' or 'Warning'
+- pictograms (TEXT[]) — array of GHS pictogram codes, e.g. ARRAY['GHS02', 'GHS07']
+- source (TEXT) — default 'pubchem_ghs'
+Primary key: (inchikey, source)
+
 ### onto.reaction_classes
 Hierarchical taxonomy of reaction types.
 Columns: class_id (TEXT PK), parent_id (TEXT FK self), name (TEXT), rxno_id (TEXT), \
@@ -87,6 +114,9 @@ description (TEXT), smarts_pattern (TEXT), level (INTEGER)
 - To find molecules in a reaction: JOIN rxn.reaction_components rc ON r.reaction_id = rc.reaction_id \
 JOIN chem.molecules m ON rc.inchikey = m.inchikey
 - Filter by role: WHERE rc.role = 'catalyst' (or 'reactant', 'product', 'solvent', etc.)
+- To find bioactive molecules: JOIN chem.bioactivities b ON m.inchikey = b.inchikey
+- To find hazardous molecules: JOIN onto.hazard_data h ON m.inchikey = h.inchikey
+- For GHS code filtering, use ANY: WHERE 'H301' = ANY(h.ghs_codes)
 
 ## RDKit cartridge functions
 - mol_from_smiles('CCO'::cstring) → mol object
@@ -106,7 +136,43 @@ JOIN chem.molecules m ON rc.inchikey = m.inchikey
 5. LIMIT results to 50 unless the user specifies otherwise
 6. Use ILIKE for case-insensitive text matching on reaction_class
 7. yield_pct is 0-100, NOT 0-1
-8. Output ONLY a single SELECT statement, no semicolons\
+8. Output ONLY a single SELECT statement, no semicolons
+9. For route/path queries, use the AGE graph via cypher() function (see below)
+
+## Apache AGE Graph (chemworld)
+
+The relational data is mirrored in an Apache AGE property graph named 'chemworld'.
+Use the cypher() function for graph traversal queries (routes, paths, neighbours).
+
+### Node types:
+- :Molecule {inchikey, smiles, mol_formula, mol_weight, commercially_available}
+- :Reaction {reaction_id, reaction_class, temperature_c, yield_pct, source}
+
+### Edge types:
+- (Molecule)-[:REACTANT_IN {stoichiometry, equivalents}]->(Reaction)
+- (Reaction)-[:PRODUCT_OF {yield_pct, is_major}]->(Molecule)
+- (Molecule)-[:CATALYSES {equivalents}]->(Reaction)
+- (Molecule)-[:SOLVENT_IN {volume_ml}]->(Reaction)
+- (Molecule)-[:SIMILAR_TO {tanimoto}]->(Molecule)
+- (Molecule)-[:PRECURSOR_OF {step_count, cumulative_yield}]->(Molecule)
+
+### Hybrid SQL+Cypher pattern:
+Wrap Cypher in the cypher() function. Cast agtype outputs with ::text for JOINs:
+```sql
+SELECT route.rxn_id::text AS reaction_id, r.yield_pct
+FROM cypher('chemworld', $$
+    MATCH (start:Molecule {commercially_available: true})
+        -[:REACTANT_IN]->(rxn:Reaction)
+        -[:PRODUCT_OF]->(target:Molecule {inchikey: 'TARGET_INCHIKEY'})
+    RETURN rxn.reaction_id
+$$) AS route(rxn_id agtype)
+JOIN rxn.reactions r ON r.reaction_id = route.rxn_id::text
+```
+
+### When to use graph vs SQL:
+- Route/path finding, neighbours, connectivity → Cypher via cypher()
+- Property filtering, aggregation, statistics → plain SQL
+- Combine both: Cypher for traversal, JOIN with relational for filtering\
 """
 
 EXAMPLE_QUERIES: list[dict[str, str]] = [
@@ -245,6 +311,65 @@ EXAMPLE_QUERIES: list[dict[str, str]] = [
             "GROUP BY r.reaction_class\n"
             "ORDER BY reaction_count DESC\n"
             "LIMIT 20"
+        ),
+    },
+    {
+        "question": "What are the one-step synthesis routes to aspirin from commercially available starting materials?",
+        "sql": (
+            "SELECT route.start_ik::text AS start_inchikey,\n"
+            "       route.start_smiles::text AS start_smiles,\n"
+            "       route.rxn_id::text AS reaction_id,\n"
+            "       r.yield_pct, r.reaction_class\n"
+            "FROM cypher('chemworld', $$\n"
+            "    MATCH (s:Molecule {commercially_available: true})\n"
+            "        -[:REACTANT_IN]->(rxn:Reaction)\n"
+            "        -[:PRODUCT_OF]->(t:Molecule {inchikey: 'BSYNRYMUTXBXSQ-UHFFFAOYSA-N'})\n"
+            "    RETURN s.inchikey, s.smiles, rxn.reaction_id\n"
+            "$$) AS route(start_ik agtype, start_smiles agtype, rxn_id agtype)\n"
+            "JOIN rxn.reactions r ON r.reaction_id = route.rxn_id::text\n"
+            "WHERE r.yield_pct IS NOT NULL\n"
+            "ORDER BY r.yield_pct DESC\n"
+            "LIMIT 20"
+        ),
+    },
+    {
+        "question": "Which molecules are most similar to ethanol in the graph?",
+        "sql": (
+            "SELECT route.neighbor_ik::text AS inchikey,\n"
+            "       route.neighbor_smiles::text AS smiles,\n"
+            "       route.tanimoto::float AS tanimoto\n"
+            "FROM cypher('chemworld', $$\n"
+            "    MATCH (m:Molecule {inchikey: 'LFQSCWFLJHTTHZ-UHFFFAOYSA-N'})\n"
+            "        -[s:SIMILAR_TO]-(n:Molecule)\n"
+            "    RETURN n.inchikey, n.smiles, s.tanimoto\n"
+            "$$) AS route(neighbor_ik agtype, neighbor_smiles agtype, tanimoto agtype)\n"
+            "ORDER BY route.tanimoto::float DESC\n"
+            "LIMIT 20"
+        ),
+    },
+    {
+        "question": "Which molecules have IC50 activity below 100 nM?",
+        "sql": (
+            "SELECT m.inchikey, m.canonical_smiles, m.iupac_name,\n"
+            "       b.target_name, b.activity_type, b.value, b.unit\n"
+            "FROM chem.bioactivities b\n"
+            "JOIN chem.molecules m ON b.inchikey = m.inchikey\n"
+            "WHERE b.activity_type = 'IC50'\n"
+            "  AND b.value < 100\n"
+            "  AND b.unit = 'nM'\n"
+            "ORDER BY b.value ASC\n"
+            "LIMIT 50"
+        ),
+    },
+    {
+        "question": "Which molecules have GHS danger classification?",
+        "sql": (
+            "SELECT m.inchikey, m.canonical_smiles, m.iupac_name,\n"
+            "       h.signal_word, h.ghs_codes, h.pictograms\n"
+            "FROM onto.hazard_data h\n"
+            "JOIN chem.molecules m ON h.inchikey = m.inchikey\n"
+            "WHERE h.signal_word = 'Danger'\n"
+            "LIMIT 50"
         ),
     },
     {
