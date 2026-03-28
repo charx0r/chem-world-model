@@ -62,7 +62,15 @@ RUN cd /tmp \
         -DRDK_BUILD_INCHI_SUPPORT=ON \
         -DRDK_BUILD_FREETYPE_SUPPORT=OFF \
         -DRDK_BUILD_CAIRO_SUPPORT=OFF \
+        -DRDK_BUILD_CHEMDRAW_SUPPORT=OFF \
+        -DRDK_BUILD_SWIG_WRAPPERS=OFF \
+        -DRDK_BUILD_CFFI_LIB=OFF \
+        -DRDK_BUILD_YAEHMOP_SUPPORT=OFF \
+        -DRDK_BUILD_XYZ2MOL_SUPPORT=OFF \
+        -DRDK_USE_URF=OFF \
+        -DRDK_BUILD_THREADSAFE_SSS=ON \
         -DPostgreSQL_CONFIG=/usr/bin/pg_config \
+        -DPostgreSQL_INCLUDE_DIR=/usr/include/postgresql/17/server \
         -DCMAKE_BUILD_TYPE=Release \
     && make -j$(nproc) \
     && make install
