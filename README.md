@@ -1,7 +1,7 @@
 # ChemWorldModel
 
 <p align="center">
-  <img src="web/public/logo.svg" width="80" alt="ChemWorldModel">
+  <img src="https://raw.githubusercontent.com/charx0r/chem-world-model/main/web/public/logo.svg" width="80" alt="ChemWorldModel">
 </p>
 
 A queryable knowledge graph of chemical reactions built on PostgreSQL 17. Ingests ~1.8 million reactions from the Open Reaction Database, enriches molecules from PubChem/ChEBI/ChEMBL/GHS, and exposes the data through a natural language query interface, molecular similarity search, and retrosynthetic route planning.
