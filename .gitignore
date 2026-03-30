@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# Environment
+.env
+
+# Docker
+pgdata/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Testing
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (large files downloaded separately)
+data/
+
+# Database backups
+backups/
+
+# Frontend build artifacts and config
+web/node_modules/
+web/.next/
+web/CLAUDE.md
+web/AGENTS.md
+
+alembic.ini
